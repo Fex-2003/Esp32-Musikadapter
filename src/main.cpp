@@ -44,6 +44,14 @@ static int queuedTrack = -1;
 enum class Transition { None, Stop, Mode, Sleep };
 static Transition transition=Transition::None;
 static bool sleepRequested=false;
+// TEMPORARY MP3 transition diagnostics; remove after timing measurements.
+static void mp3Trace(const char* event) {
+  Serial.printf("[MP3 t=%lu] MAIN: %s\n", static_cast<unsigned long>(millis()), event);
+}
+static void mp3TraceDuration(const char* event, uint32_t startedAt) {
+  Serial.printf("[MP3 t=%lu] MAIN: %s (%lu ms)\n", static_cast<unsigned long>(millis()), event,
+                static_cast<unsigned long>(millis()-startedAt));
+}
 bool busy() { return editBusy || transition!=Transition::None || sleepRequested || pendingMode>=0; }
 void activity() { lastActivity=millis(); noteLcdInteraction(); }
 void setVolume(uint8_t value,bool persist) {
@@ -51,7 +59,12 @@ void setVolume(uint8_t value,bool persist) {
   if(persist && preferences.getUChar("sdVolume",255)!=sdVolume && preferences.putUChar("sdVolume",sdVolume)!=1)
     note="Lautstaerke angewendet, aber NVS-Speicherung fehlgeschlagen.";
 }
-void requestStop() { if(mode==Mode::Playlist && transition==Transition::None) transition=Transition::Stop; }
+void requestStop() {
+  if(mode==Mode::Playlist && transition==Transition::None) {
+    mp3Trace("playlist stop requested; waiting for fade/transition service");
+    transition=Transition::Stop;
+  }
+}
 
 const char* modeName() {
   return mode == Mode::Motion ? "Bewegungsmelder" : mode == Mode::Playlist ? "Playlist" : "Bluetooth";
@@ -67,12 +80,16 @@ static void releaseTracks() {
   motionLoaded = false; previousIndex = -1;
 }
 void stopPlayback() {
+  const bool traceStop=!currentSong.isEmpty() || playlistRunning;
+  const uint32_t stopStartedAt=millis();
+  if(traceStop) mp3Trace("stopPlayback begin");
   if (mode != Mode::Bluetooth) audio::stop();
   playlistRunning = false; currentSong = ""; activePlaylist = "";
   playlistPosition = playlistLength = 0;
   currentHadStart = false; failedInRow = 0; nextTry = 0;
   if(queuedTrack>=0 && note.startsWith("Als Naechstes vorgemerkt: ")) note="";
   queuedTrack = -1;
+  if(traceStop) mp3TraceDuration("stopPlayback complete", stopStartedAt);
 }
 static void ensureVisibleSelection() {
   int found = playlistIndex(selectedPlaylist);
@@ -128,12 +145,15 @@ bool startPlaylist(const String& name, String& error) {
   if (index < 0) { error = "Playlist nicht vorhanden."; return false; }
   // Kopie vor Freigabe anderer Daten; Einstellungen gelten fuer diesen Durchlauf.
   const Playlist chosen = playlists[index];
+  Serial.printf("[MP3 t=%lu] MAIN: startPlaylist requested: %s\n", static_cast<unsigned long>(millis()), chosen.name.c_str());
   if(mode!=Mode::Playlist && audio::state()==audio::State::Running) {
     pendingPlaylist=name; requestMode(Mode::Playlist); return true;
   }
   if (!switchWifiMode(Mode::Playlist, error)) return false;
   stopPlayback(); releaseTracks();
-  if (!storage::loadTracks(chosen.name, activeTracks, error)) { releaseTracks(); return false; }
+  const uint32_t loadStartedAt=millis();
+  if (!storage::loadTracks(chosen.name, activeTracks, error)) { mp3TraceDuration("playlist file scan failed", loadStartedAt); releaseTracks(); return false; }
+  mp3TraceDuration("playlist file scan", loadStartedAt);
   if (activeTracks.empty()) { error = "Playlist enthaelt keine zulaessigen MP3-Dateien."; return false; }
   activePlaylist = chosen.name; activeShuffle = chosen.shuffle; activeRepeat = chosen.repeat;
   if (!chosen.hidden) {
@@ -193,55 +213,73 @@ static void returnToPlaylistSelection(const String& message = "", bool automatic
   if (!message.isEmpty()) note = message;
 }
 static bool playIndex(size_t index, bool rememberPlaylist = false, size_t resumePosition = 0) {
+  const uint32_t playIndexStartedAt=millis();
   String error;
   const String folder = mode == Mode::Motion ? String("") : activePlaylist;
   const String path = storage::directory(folder) + "/" + activeTracks[index].file;
+  Serial.printf("[MP3 t=%lu] MAIN: playIndex begin: %s\n", static_cast<unsigned long>(millis()), activeTracks[index].file.c_str());
   previousIndex = static_cast<int>(index);
-  if(issues::blocked(path)) { ++failedInRow; return false; }
+  if(issues::blocked(path)) { mp3TraceDuration("playIndex skipped blocked track", playIndexStartedAt); ++failedInRow; return false; }
   if (audio::play(path, sdVolume, error)) {
     currentSong = activeTracks[index].file;
     currentHadStart = true; note = "";
     if (rememberPlaylist) rememberPlaylistTrack(static_cast<uint16_t>(index), resumePosition);
+    mp3TraceDuration("playIndex returned after audio::play", playIndexStartedAt);
     return true;
   }
   currentSong = ""; note = error;
   Serial.printf("[Audio] Fehler %s: %s\n", path.c_str(), error.c_str());
+  mp3TraceDuration("playIndex start failed", playIndexStartedAt);
   if(storage::healthy() && audio::fileFailed())
     issues::record(path,error);
   ++failedInRow; nextTry = millis() + cfg::RETRY_MS;
+  Serial.printf("[MP3 t=%lu] MAIN: retry scheduled in %lu ms after start failure\n",
+                static_cast<unsigned long>(millis()), static_cast<unsigned long>(cfg::RETRY_MS));
   if (mode == Mode::Motion) activeTracks[index].weight = 0; // nur RAM, CSV unveraendert
   return false;
 }
 static bool playNextPlaylistTrack() {
+  const uint32_t nextStartedAt=millis();
+  mp3Trace("playNextPlaylistTrack begin");
   if (queuedTrack >= 0) {
     const uint16_t index = static_cast<uint16_t>(queuedTrack);
     queuedTrack = -1;
     playlist_order::takeRequested(playOrder, playlistPosition, index);
-    return playIndex(index, true, playlistPosition);
+    const bool started=playIndex(index, true, playlistPosition);
+    mp3TraceDuration("playNextPlaylistTrack (queued) complete", nextStartedAt);
+    return started;
   }
   if (playlistPosition >= playOrder.size()) {
-    if (!activeRepeat) { returnToPlaylistSelection("", true); return false; }
+    if (!activeRepeat) { mp3Trace("playlist reached end; repeat disabled"); returnToPlaylistSelection("", true); return false; }
     rules::order(playOrder, activeTracks.size(), activeShuffle, previousIndex, esp_random);
     playlistPosition = 0;
     recentTracks.clear();
   }
   const size_t orderPosition = playlistPosition++;
-  return playIndex(playOrder[orderPosition], true, playlistPosition);
+  const bool started=playIndex(playOrder[orderPosition], true, playlistPosition);
+  mp3TraceDuration("playNextPlaylistTrack complete", nextStartedAt);
+  return started;
 }
 static void skipPlaylistForward() {
   if (!playlistRunning) return;
+  const uint32_t skipStartedAt=millis();
+  Serial.printf("[MP3 t=%lu] MAIN: forward skip begin; current=%s\n", static_cast<unsigned long>(millis()), currentSong.c_str());
   audio::stop(); currentSong = ""; currentHadStart = false;
   failedInRow = 0; nextTry = 0;
   playNextPlaylistTrack();
+  mp3TraceDuration("forward skip to audio::play return", skipStartedAt);
 }
 static void skipPlaylistBack() {
   if (!playlistRunning || recentTracks.size() < 2) return;
+  const uint32_t skipStartedAt=millis();
+  Serial.printf("[MP3 t=%lu] MAIN: backward skip begin; current=%s\n", static_cast<unsigned long>(millis()), currentSong.c_str());
   recentTracks.pop_back();
   const PlayedTrack target = recentTracks.back();
   playlistPosition = target.resumePosition;
   audio::stop(); currentSong = ""; currentHadStart = false;
   failedInRow = 0; nextTry = 0;
   playIndex(target.index);
+  mp3TraceDuration("backward skip to audio::play return", skipStartedAt);
 }
 bool selectTrack(const String& playlist, const String& file, bool next, String& error) {
   if(busy() || controls::fullyLocked() || mode==Mode::Bluetooth || !audioOk) {
@@ -294,7 +332,10 @@ static void servicePlayback() {
     storage::fault(audio::errorMessage()); stopPlayback(); return;
   }
   if (state == audio::State::Ended || state == audio::State::MotionTimeout || state==audio::State::FileError) {
+    const uint32_t serviceStartedAt=millis();
     const bool hadSamples = audio::emittedSamples();
+    Serial.printf("[MP3 t=%lu] MAIN: terminal state=%u detected; song=%s samples=%s\n",
+                  static_cast<unsigned long>(millis()), static_cast<unsigned>(state), currentSong.c_str(), hadSamples?"yes":"no");
     if(state==audio::State::FileError && !currentSong.isEmpty()) {
       const String path=storage::directory(mode==Mode::Motion?String(""):activePlaylist)+"/"+currentSong;
       issues::record(path,audio::errorMessage());
@@ -303,11 +344,14 @@ static void servicePlayback() {
     if (currentHadStart && (state == audio::State::Ended || state==audio::State::FileError)) {
       if (!hadSamples || state==audio::State::FileError) {
         ++failedInRow; nextTry = millis() + cfg::RETRY_MS;
+        Serial.printf("[MP3 t=%lu] MAIN: retry scheduled in %lu ms after failed track\n",
+                      static_cast<unsigned long>(millis()), static_cast<unsigned long>(cfg::RETRY_MS));
         if (mode == Mode::Motion && previousIndex >= 0) activeTracks[previousIndex].weight = 0;
         note = "Titel ohne dekodierbare Audiosamples uebersprungen.";
       } else { failedInRow = 0; nextTry = 0; }
     }
     currentHadStart = false;
+    mp3TraceDuration("servicePlayback terminal handling/audio::stop", serviceStartedAt);
   }
   if (!due(nextTry)) return;
   if (mode == Mode::Motion) {

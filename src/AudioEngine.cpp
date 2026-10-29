@@ -21,6 +21,9 @@ static void* decoderWorkspace = nullptr;
 static std::atomic<State> current{State::Idle};
 static std::atomic<bool> gate{false}, wanted{false}, pausedPlayback{false};
 static std::atomic<uint32_t> graceMs{0}, acceptedSamples{0};
+// TEMPORARY MP3 transition diagnostics; remove after timing measurements.
+static std::atomic<uint32_t> playRequestedAt{0}, firstSampleAt{0}, firstDecoderLoopAt{0};
+static std::atomic<bool> firstSamplePending{false}, firstDecoderIterationPending{false};
 static std::atomic<bool> requestedPause{false}, requestedStop{false};
 static std::atomic<bool> startFileFailure{false};
 static Envelope envelope(cfg::AUDIO_FADE_MS);
@@ -31,6 +34,13 @@ static bool decoderFailed = false;
 static uint32_t bytesWithoutSamples=0;
 static unsigned decoderErrors=0;
 static uint32_t lastProgress = 0, lastCount = 0;
+static void trace(const char* event) {
+  Serial.printf("[MP3 t=%lu] AUDIO: %s\n", static_cast<unsigned long>(millis()), event);
+}
+static void traceDuration(const char* event, uint32_t startedAt) {
+  Serial.printf("[MP3 t=%lu] AUDIO: %s (%lu ms)\n", static_cast<unsigned long>(millis()), event,
+                static_cast<unsigned long>(millis()-startedAt));
+}
 static void decoderStatus(void*,int code,const char*) {
   // BUFLEN und LOSTSYNC sind auch beim normalen Puffer-/Tag-Ende moeglich.
   if(code!=0x0001 && code!=0x0101 && ++decoderErrors>=8) decoderFailed=true;
@@ -58,6 +68,10 @@ class Output : public AudioOutputI2S {
     const bool ok = AudioOutputI2S::ConsumeSample(sample);
     if (ok) {
       const uint32_t count=acceptedSamples.fetch_add(1, std::memory_order_relaxed);
+      if (count == 0) {
+        firstSampleAt.store(millis(), std::memory_order_relaxed);
+        firstSamplePending.store(true, std::memory_order_release);
+      }
       bytesWithoutSamples=0;
       if((count & 1023)==0) lastProgress=millis();
     }
@@ -94,6 +108,7 @@ static bool skipId3v2(AudioFileSourceSD& file, String& error) {
 }
 // Caller haelt Audio-Lock und SD-Lock. Pointer bleiben nur hier veraenderlich.
 static void cleanup() {
+  const uint32_t cleanupStartedAt=millis();
   requestedStop=false; requestedPause=false; pausedPlayback=false;
   if (decoder) {
     if (decoder->isRunning()) decoder->stop();
@@ -102,6 +117,7 @@ static void cleanup() {
   delete buffer; buffer = nullptr;
   delete source; source = nullptr;
   if (output) output->stop();
+  traceDuration("cleanup (Decoder/Buffer/SD/I2S)", cleanupStartedAt);
 }
 static void task(void*) {
   bool sawMotion = false, oldGate = false, motionPaused = false;
@@ -141,15 +157,34 @@ static void task(void*) {
             }
           }
         }
+        const bool firstIteration=firstDecoderIterationPending.exchange(false, std::memory_order_acq_rel);
+        const uint32_t iterationStartedAt=millis();
+        if (firstIteration) firstDecoderLoopAt.store(iterationStartedAt, std::memory_order_relaxed);
         if (decoder && current.load() == State::Running && !pausedPlayback.load() &&
             (!decoder->isRunning() || !decoder->loop())) {
+          trace("decoder end/error detected in Audio-Task");
           // Letzte DMA-Samples ausspielen, dann alle Datei-Handles schliessen.
-          if (output && decoder->isRunning() && acceptedSamples.load() > 256) output->flush();
+          if (output && decoder->isRunning() && acceptedSamples.load() > 256) {
+            const uint32_t flushStartedAt=millis();
+            output->flush();
+            traceDuration("I2S flush after decoder end", flushStartedAt);
+          }
           const bool broken=readFailed || decoderFailed || !decoder->isRunning() || acceptedSamples.load()<=256;
           lastError=readFailed ? "SD-Lesefehler innerhalb der MP3." : "MP3-Decoderfehler / keine dekodierbaren Samples.";
           cleanup();
           if (readFailed && !storage::healthy()) current=State::StorageError;
           else current=broken ? State::FileError : State::Ended;
+          trace("terminal audio state published");
+        }
+        if (firstIteration) traceDuration("first decoder iteration returned", iterationStartedAt);
+        if (firstSamplePending.exchange(false, std::memory_order_acq_rel)) {
+          const uint32_t sampleAt=firstSampleAt.load(std::memory_order_relaxed);
+          const uint32_t requestedAt=playRequestedAt.load(std::memory_order_relaxed);
+          const uint32_t loopAt=firstDecoderLoopAt.load(std::memory_order_relaxed);
+          Serial.printf("[MP3 t=%lu] AUDIO: first I2S sample accepted; since play request=%lu ms, since decoder iteration=%lu ms\n",
+                        static_cast<unsigned long>(sampleAt),
+                        static_cast<unsigned long>(sampleAt-requestedAt),
+                        static_cast<unsigned long>(sampleAt-loopAt));
         }
         if (decoder && !pausedPlayback.load()) {
           const uint32_t count=acceptedSamples.load();
@@ -177,9 +212,13 @@ bool begin() {
 }
 void stop() {
   if (!engineMutex) return;
+  const uint32_t stopStartedAt=millis();
+  trace("audio::stop begin");
   Lock audioLock; storage::Guard sdLock;
+  traceDuration("audio::stop lock acquisition", stopStartedAt);
   pausedPlayback=false; requestedPause=false; requestedStop=false;
   envelope.reset(); cleanup(); current.store(State::Idle);
+  trace("audio::stop end; state=Idle");
 }
 void pause(bool enabled) {
   if (!engineMutex) return;
@@ -201,39 +240,64 @@ String errorMessage() { if(!engineMutex) return ""; Lock lock; return lastError;
 bool fileFailed() { return startFileFailure.load(); }
 bool paused() { return pausedPlayback.load(); }
 bool play(const String& path, uint8_t percent, String& error) {
+  const uint32_t playStartedAt=millis();
+  playRequestedAt.store(playStartedAt, std::memory_order_relaxed);
+  firstSamplePending.store(false, std::memory_order_relaxed);
+  firstDecoderIterationPending.store(false, std::memory_order_relaxed);
+  trace("audio::play begin");
   startFileFailure=false;
   if (!engineMutex || !taskHandle || !output || !storage::ready) { error = "Audio/SD nicht bereit."; return false; }
-  Lock audioLock; storage::Guard sdLock;
+  const uint32_t audioLockStartedAt=millis();
+  Lock audioLock;
+  traceDuration("audio::play audio lock acquisition", audioLockStartedAt);
+  const uint32_t sdLockStartedAt=millis();
+  storage::Guard sdLock;
+  traceDuration("audio::play SD lock acquisition", sdLockStartedAt);
   pausedPlayback=false; requestedPause=false; requestedStop=false; envelope.reset();
   readFailed=false; decoderFailed=false; decoderErrors=0; bytesWithoutSamples=0;
   lastError=""; lastCount=0; lastProgress=millis();
   cleanup(); current.store(State::Idle); acceptedSamples.store(0);
-  if (!storage::checkMp3(path, error)) { startFileFailure=true; return false; }
+  uint32_t phaseStartedAt=millis();
+  if (!storage::checkMp3(path, error)) { traceDuration("checkMp3 failed", phaseStartedAt); startFileFailure=true; return false; }
+  traceDuration("checkMp3", phaseStartedAt);
   // Libmad-Arbeitsbereich einmal je SD-Boot reservieren, nicht pro Musikdatei.
+  phaseStartedAt=millis();
   const size_t workBytes = AudioGeneratorMP3::preAllocSize();
   if (!decoderWorkspace) {
     if (ESP.getFreeHeap() < workBytes + cfg::MP3_BUFFER_BYTES + cfg::MIN_HEAP_RESERVE) {
+      traceDuration("decoder RAM reserve check failed", phaseStartedAt);
       error = "Zu wenig RAM fuer MP3-Decoder und Sicherheitsreserve."; return false;
     }
     decoderWorkspace = malloc(workBytes);
   }
   if (!inputBuffer) inputBuffer = static_cast<uint8_t*>(malloc(cfg::MP3_BUFFER_BYTES));
-  if (!decoderWorkspace || !inputBuffer) { error = "MP3-Puffer konnte nicht reserviert werden."; return false; }
+  if (!decoderWorkspace || !inputBuffer) { traceDuration("decoder/input buffer allocation failed", phaseStartedAt); error = "MP3-Puffer konnte nicht reserviert werden."; return false; }
+  traceDuration("decoder workspace/input buffer preparation", phaseStartedAt);
+  phaseStartedAt=millis();
   source = new (std::nothrow) CheckedSource();
-  if(!source) { error="MP3-Objekt konnte nicht angelegt werden."; cleanup(); return false; }
-  if(!source->open(path.c_str())) { error="MP3-Datei nicht geoeffnet."; startFileFailure=true; cleanup(); return false; }
-  if (!skipId3v2(*source, error)) { startFileFailure=true; cleanup(); return false; }
+  if(!source) { traceDuration("SD source allocation failed", phaseStartedAt); error="MP3-Objekt konnte nicht angelegt werden."; cleanup(); return false; }
+  if(!source->open(path.c_str())) { traceDuration("SD file open failed", phaseStartedAt); error="MP3-Datei nicht geoeffnet."; startFileFailure=true; cleanup(); return false; }
+  traceDuration("SD file open", phaseStartedAt);
+  phaseStartedAt=millis();
+  if (!skipId3v2(*source, error)) { traceDuration("ID3 skip failed", phaseStartedAt); startFileFailure=true; cleanup(); return false; }
+  traceDuration("ID3 skip", phaseStartedAt);
   buffer = new (std::nothrow) AudioFileSourceBuffer(source, inputBuffer, cfg::MP3_BUFFER_BYTES);
   // Preallocation vermeidet die ungueltigen freien Pointer bestimmter 1.9.9-
   // Fehlerpfade vor begin(). Speicherbesitz bleibt explizit bei dieser Engine.
   decoder = new (std::nothrow) AudioGeneratorMP3(decoderWorkspace, static_cast<int>(workBytes));
-  if (!buffer || !decoder) { error = "MP3-Objekt konnte nicht angelegt werden."; cleanup(); return false; }
+  if (!buffer || !decoder) { traceDuration("decoder/buffer object allocation failed", phaseStartedAt); error = "MP3-Objekt konnte nicht angelegt werden."; cleanup(); return false; }
   decoder->RegisterStatusCB(decoderStatus,nullptr);
   userVolume=userGain(percent); output->SetGain(userVolume);
-  if (!decoder->begin(buffer, output)) { error = "MP3-Decoder/I2S konnte nicht starten."; cleanup(); return false; }
+  traceDuration("source/buffer/decoder object preparation", phaseStartedAt);
+  phaseStartedAt=millis();
+  if (!decoder->begin(buffer, output)) { traceDuration("decoder->begin failed", phaseStartedAt); error = "MP3-Decoder/I2S konnte nicht starten."; cleanup(); return false; }
+  traceDuration("decoder->begin", phaseStartedAt);
   bytesWithoutSamples=0; lastProgress=millis();
+  firstDecoderIterationPending.store(true, std::memory_order_release);
   current.store(State::Running);
-  Serial.printf("[Audio] %s | Heap=%u | Decoder=%u B\n", path.c_str(), ESP.getFreeHeap(), static_cast<unsigned>(workBytes));
+  Serial.printf("[MP3 t=%lu] AUDIO: decoder running; total audio::play=%lu ms | %s | Heap=%u | Decoder=%u B\n",
+                static_cast<unsigned long>(millis()), static_cast<unsigned long>(millis()-playStartedAt),
+                path.c_str(), ESP.getFreeHeap(), static_cast<unsigned>(workBytes));
   return true;
 }
 void volume(uint8_t percent) {
