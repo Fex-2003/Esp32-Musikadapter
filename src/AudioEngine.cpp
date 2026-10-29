@@ -9,11 +9,19 @@
 #include <freertos/task.h>
 #include <atomic>
 #include <new>
+#include <algorithm>
+
+#if AUDIO_MP3_TRANSITION_TRACE
+#define MP3_TRACE_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+#define MP3_TRACE_PRINTF(...) do {} while (0)
+#endif
 
 namespace audio {
+class CheckedSource;
 static SemaphoreHandle_t engineMutex = nullptr;
 static TaskHandle_t taskHandle = nullptr;
-static AudioFileSourceSD* source = nullptr;
+static CheckedSource* source = nullptr;
 static AudioFileSourceBuffer* buffer = nullptr;
 static AudioGeneratorMP3* decoder = nullptr;
 static uint8_t* inputBuffer = nullptr;
@@ -35,11 +43,11 @@ static uint32_t bytesWithoutSamples=0;
 static unsigned decoderErrors=0;
 static uint32_t lastProgress = 0, lastCount = 0;
 static void trace(const char* event) {
-  Serial.printf("[MP3 t=%lu] AUDIO: %s\n", static_cast<unsigned long>(millis()), event);
+  MP3_TRACE_PRINTF("[MP3 t=%lu] AUDIO: %s\n", static_cast<unsigned long>(millis()), event);
 }
 static void traceDuration(const char* event, uint32_t startedAt) {
-  Serial.printf("[MP3 t=%lu] AUDIO: %s (%lu ms)\n", static_cast<unsigned long>(millis()), event,
-                static_cast<unsigned long>(millis()-startedAt));
+  MP3_TRACE_PRINTF("[MP3 t=%lu] AUDIO: %s (%lu ms)\n", static_cast<unsigned long>(millis()), event,
+                   static_cast<unsigned long>(millis()-startedAt));
 }
 static void decoderStatus(void*,int code,const char*) {
   // BUFLEN und LOSTSYNC sind auch beim normalen Puffer-/Tag-Ende moeglich.
@@ -47,23 +55,65 @@ static void decoderStatus(void*,int code,const char*) {
 }
 class CheckedSource : public AudioFileSourceSD {
  public:
+  ~CheckedSource() { if (prefetched) free(prefetched); }
+  void monitor(bool enabled) { monitored=enabled; }
+  uint32_t prefetchInitial() {
+    if (prefetched || !getSize()) return 0;
+    prefetched=static_cast<uint8_t*>(malloc(cfg::MP3_BUFFER_BYTES));
+    if (!prefetched) return 0;
+    prefetchedLength=AudioFileSourceSD::read(prefetched,cfg::MP3_BUFFER_BYTES);
+    prefetchedOffset=0;
+    if (!prefetchedLength) { free(prefetched); prefetched=nullptr; }
+    return prefetchedLength;
+  }
+  uint32_t getPos() override {
+    const uint32_t actual=AudioFileSourceSD::getPos();
+    const uint32_t remaining=prefetchedLength-prefetchedOffset;
+    return actual>=remaining ? actual-remaining : 0;
+  }
   uint32_t read(void* data, uint32_t len) override {
-    if(decoder && current.load()==State::Running &&
+    if(monitored && decoder && current.load()==State::Running &&
        (decoderFailed || bytesWithoutSamples>65536 || uint32_t(millis()-lastProgress)>3000)) {
       decoderFailed=true; return 0; // beendet auch die interne libmad-Retryschleife
     }
     const uint32_t before=getPos(), size=getSize();
-    const uint32_t got=AudioFileSourceSD::read(data,len);
-    bytesWithoutSamples+=got;
-    if (len && before<size && got==0) readFailed=true;
+    uint32_t got=0;
+    if (prefetchedOffset<prefetchedLength) {
+      const uint32_t cached=std::min(len,prefetchedLength-prefetchedOffset);
+      memcpy(data,prefetched+prefetchedOffset,cached);
+      prefetchedOffset+=cached; got+=cached;
+      if(prefetchedOffset==prefetchedLength) {
+        free(prefetched); prefetched=nullptr; prefetchedLength=prefetchedOffset=0;
+      }
+    }
+    if (got<len) got+=AudioFileSourceSD::read(static_cast<uint8_t*>(data)+got,len-got);
+    if(monitored) {
+      bytesWithoutSamples+=got;
+      if (len && before<size && got==0) readFailed=true;
+    }
     return got;
   }
+ private:
+  uint8_t* prefetched=nullptr;
+  uint32_t prefetchedLength=0, prefetchedOffset=0;
+  bool monitored=true;
 };
 
 
 class Output : public AudioOutputI2S {
  public:
   Output() : AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S, 12, AudioOutputI2S::APLL_DISABLE) {}
+  void retainI2s(bool retain) { retained=retain; }
+  bool retainsI2s() const { return retained; }
+  bool begin() override {
+    // Beim fehlerfreien Titeluebergang laufen die letzten DMA-Samples weiter.
+    if(retained) return true;
+    return AudioOutputI2S::begin();
+  }
+  bool stop() override {
+    if(retained) return true;
+    return AudioOutputI2S::stop();
+  }
   bool ConsumeSample(int16_t sample[2]) override {
     const bool ok = AudioOutputI2S::ConsumeSample(sample);
     if (ok) {
@@ -77,19 +127,32 @@ class Output : public AudioOutputI2S {
     }
     return ok;
   }
+ private:
+  bool retained=false;
 };
 static Output* output = nullptr;
+static CheckedSource* preparedSource = nullptr;
+static String preparedPath;
 class Lock {
  public: Lock() { xSemaphoreTake(engineMutex, portMAX_DELAY); }
   ~Lock() { xSemaphoreGive(engineMutex); }
 };
 // Caller haelt Audio-Lock und SD-Lock. Pointer bleiben nur hier veraenderlich.
-static bool skipId3v2(AudioFileSourceSD& file, String& error) {
+static void clearPrepared() {
+  delete preparedSource; preparedSource=nullptr; preparedPath="";
+}
+static bool validateAndSkipId3v2(AudioFileSourceSD& file, String& error) {
+  if(file.getSize()<4 || file.getSize()>cfg::MAX_FILE_BYTES) {
+    error="MP3 leer, zu kurz oder groesser als 256 MiB."; return false;
+  }
   uint8_t header[10];
   if (file.read(header, sizeof(header)) != sizeof(header)) {
     error = "MP3-ID3-Header nicht lesbar."; return false;
   }
   if (header[0] != 'I' || header[1] != 'D' || header[2] != '3') {
+    if(header[0]!=0xff || (header[1]&0xe0)!=0xe0) {
+      error="Kein ID3-/MP3-Frame-Header am Dateianfang."; return false;
+    }
     if (!file.seek(0, SEEK_SET)) { error = "MP3-Dateianfang nicht erreichbar."; return false; }
     return true;
   }
@@ -107,8 +170,9 @@ static bool skipId3v2(AudioFileSourceSD& file, String& error) {
   return true;
 }
 // Caller haelt Audio-Lock und SD-Lock. Pointer bleiben nur hier veraenderlich.
-static void cleanup() {
+static void cleanup(bool retainI2s=false) {
   const uint32_t cleanupStartedAt=millis();
+  if(output) output->retainI2s(retainI2s);
   requestedStop=false; requestedPause=false; pausedPlayback=false;
   if (decoder) {
     if (decoder->isRunning()) decoder->stop();
@@ -117,7 +181,7 @@ static void cleanup() {
   delete buffer; buffer = nullptr;
   delete source; source = nullptr;
   if (output) output->stop();
-  traceDuration("cleanup (Decoder/Buffer/SD/I2S)", cleanupStartedAt);
+  traceDuration(retainI2s ? "cleanup (Decoder/Buffer/SD; I2S retained)" : "cleanup (Decoder/Buffer/SD/I2S)", cleanupStartedAt);
 }
 static void task(void*) {
   bool sawMotion = false, oldGate = false, motionPaused = false;
@@ -163,15 +227,10 @@ static void task(void*) {
         if (decoder && current.load() == State::Running && !pausedPlayback.load() &&
             (!decoder->isRunning() || !decoder->loop())) {
           trace("decoder end/error detected in Audio-Task");
-          // Letzte DMA-Samples ausspielen, dann alle Datei-Handles schliessen.
-          if (output && decoder->isRunning() && acceptedSamples.load() > 256) {
-            const uint32_t flushStartedAt=millis();
-            output->flush();
-            traceDuration("I2S flush after decoder end", flushStartedAt);
-          }
           const bool broken=readFailed || decoderFailed || !decoder->isRunning() || acceptedSamples.load()<=256;
           lastError=readFailed ? "SD-Lesefehler innerhalb der MP3." : "MP3-Decoderfehler / keine dekodierbaren Samples.";
-          cleanup();
+          if(!broken) trace("normal end: I2S DMA tail retained for handoff");
+          cleanup(!broken);
           if (readFailed && !storage::healthy()) current=State::StorageError;
           else current=broken ? State::FileError : State::Ended;
           trace("terminal audio state published");
@@ -181,10 +240,10 @@ static void task(void*) {
           const uint32_t sampleAt=firstSampleAt.load(std::memory_order_relaxed);
           const uint32_t requestedAt=playRequestedAt.load(std::memory_order_relaxed);
           const uint32_t loopAt=firstDecoderLoopAt.load(std::memory_order_relaxed);
-          Serial.printf("[MP3 t=%lu] AUDIO: first I2S sample accepted; since play request=%lu ms, since decoder iteration=%lu ms\n",
-                        static_cast<unsigned long>(sampleAt),
-                        static_cast<unsigned long>(sampleAt-requestedAt),
-                        static_cast<unsigned long>(sampleAt-loopAt));
+          MP3_TRACE_PRINTF("[MP3 t=%lu] AUDIO: first I2S sample accepted; since play request=%lu ms, since decoder iteration=%lu ms\n",
+                           static_cast<unsigned long>(sampleAt),
+                           static_cast<unsigned long>(sampleAt-requestedAt),
+                           static_cast<unsigned long>(sampleAt-loopAt));
         }
         if (decoder && !pausedPlayback.load()) {
           const uint32_t count=acceptedSamples.load();
@@ -256,10 +315,26 @@ bool play(const String& path, uint8_t percent, String& error) {
   pausedPlayback=false; requestedPause=false; requestedStop=false; envelope.reset();
   readFailed=false; decoderFailed=false; decoderErrors=0; bytesWithoutSamples=0;
   lastError=""; lastCount=0; lastProgress=millis();
-  cleanup(); current.store(State::Idle); acceptedSamples.store(0);
+  const bool handoff=output->retainsI2s();
+  cleanup(handoff); current.store(State::Idle); acceptedSamples.store(0);
   uint32_t phaseStartedAt=millis();
-  if (!storage::checkMp3(path, error)) { traceDuration("checkMp3 failed", phaseStartedAt); startFileFailure=true; return false; }
-  traceDuration("checkMp3", phaseStartedAt);
+  const bool usePrepared=preparedSource && preparedPath==path;
+  if(usePrepared) {
+    source=preparedSource; preparedSource=nullptr; preparedPath="";
+    source->monitor(true);
+    traceDuration("prepared source adopted", phaseStartedAt);
+  } else {
+    clearPrepared();
+    source = new (std::nothrow) CheckedSource();
+    if(!source) { traceDuration("SD source allocation failed", phaseStartedAt); error="MP3-Objekt konnte nicht angelegt werden."; cleanup(); return false; }
+    source->monitor(false);
+    if(!source->open(path.c_str())) { traceDuration("SD file open failed", phaseStartedAt); error="MP3-Datei nicht geoeffnet."; startFileFailure=true; cleanup(); return false; }
+    traceDuration("SD file open", phaseStartedAt);
+    phaseStartedAt=millis();
+    if (!validateAndSkipId3v2(*source, error)) { traceDuration("MP3 header/ID3 validation failed", phaseStartedAt); startFileFailure=true; cleanup(); return false; }
+    traceDuration("MP3 header/ID3 validation", phaseStartedAt);
+    source->monitor(true);
+  }
   // Libmad-Arbeitsbereich einmal je SD-Boot reservieren, nicht pro Musikdatei.
   phaseStartedAt=millis();
   const size_t workBytes = AudioGeneratorMP3::preAllocSize();
@@ -274,13 +349,6 @@ bool play(const String& path, uint8_t percent, String& error) {
   if (!decoderWorkspace || !inputBuffer) { traceDuration("decoder/input buffer allocation failed", phaseStartedAt); error = "MP3-Puffer konnte nicht reserviert werden."; return false; }
   traceDuration("decoder workspace/input buffer preparation", phaseStartedAt);
   phaseStartedAt=millis();
-  source = new (std::nothrow) CheckedSource();
-  if(!source) { traceDuration("SD source allocation failed", phaseStartedAt); error="MP3-Objekt konnte nicht angelegt werden."; cleanup(); return false; }
-  if(!source->open(path.c_str())) { traceDuration("SD file open failed", phaseStartedAt); error="MP3-Datei nicht geoeffnet."; startFileFailure=true; cleanup(); return false; }
-  traceDuration("SD file open", phaseStartedAt);
-  phaseStartedAt=millis();
-  if (!skipId3v2(*source, error)) { traceDuration("ID3 skip failed", phaseStartedAt); startFileFailure=true; cleanup(); return false; }
-  traceDuration("ID3 skip", phaseStartedAt);
   buffer = new (std::nothrow) AudioFileSourceBuffer(source, inputBuffer, cfg::MP3_BUFFER_BYTES);
   // Preallocation vermeidet die ungueltigen freien Pointer bestimmter 1.9.9-
   // Fehlerpfade vor begin(). Speicherbesitz bleibt explizit bei dieser Engine.
@@ -292,13 +360,54 @@ bool play(const String& path, uint8_t percent, String& error) {
   phaseStartedAt=millis();
   if (!decoder->begin(buffer, output)) { traceDuration("decoder->begin failed", phaseStartedAt); error = "MP3-Decoder/I2S konnte nicht starten."; cleanup(); return false; }
   traceDuration("decoder->begin", phaseStartedAt);
+  output->retainI2s(false);
   bytesWithoutSamples=0; lastProgress=millis();
   firstDecoderIterationPending.store(true, std::memory_order_release);
   current.store(State::Running);
-  Serial.printf("[MP3 t=%lu] AUDIO: decoder running; total audio::play=%lu ms | %s | Heap=%u | Decoder=%u B\n",
-                static_cast<unsigned long>(millis()), static_cast<unsigned long>(millis()-playStartedAt),
-                path.c_str(), ESP.getFreeHeap(), static_cast<unsigned>(workBytes));
+  MP3_TRACE_PRINTF("[MP3 t=%lu] AUDIO: decoder running; total audio::play=%lu ms | %s | Heap=%u | Decoder=%u B\n",
+                   static_cast<unsigned long>(millis()), static_cast<unsigned long>(millis()-playStartedAt),
+                   path.c_str(), ESP.getFreeHeap(), static_cast<unsigned>(workBytes));
   return true;
+}
+bool prepare(const String& path, String& error) {
+  error="";
+  if(!engineMutex || !storage::ready || path.isEmpty()) { error="Audio/SD nicht bereit."; return false; }
+  if(ESP.getFreeHeap()<cfg::MIN_HEAP_RESERVE+cfg::MP3_BUFFER_BYTES) {
+    error="MP3-Vorbereitung: Heap-Sicherheitsreserve."; return false;
+  }
+  {
+    Lock audioLock;
+    if(preparedSource && preparedPath==path) return true;
+  }
+  const uint32_t startedAt=millis();
+  CheckedSource* candidate=nullptr;
+  {
+    storage::Guard sdLock;
+    candidate=new (std::nothrow) CheckedSource();
+    if(!candidate) { error="MP3-Vorbereitung: Speicher fehlt."; return false; }
+    candidate->monitor(false);
+    if(!candidate->open(path.c_str())) {
+      error="MP3-Vorbereitung: Datei nicht geoeffnet."; delete candidate; return false;
+    }
+    if(!validateAndSkipId3v2(*candidate,error)) {
+      error="MP3-Vorbereitung: "+error; delete candidate; return false;
+    }
+    const uint32_t cached=candidate->prefetchInitial();
+    MP3_TRACE_PRINTF("[MP3 t=%lu] AUDIO: prepared next track (%lu cached bytes, %lu ms): %s\n",
+                     static_cast<unsigned long>(millis()), static_cast<unsigned long>(cached),
+                     static_cast<unsigned long>(millis()-startedAt), path.c_str());
+  }
+  {
+    Lock audioLock; storage::Guard sdLock;
+    clearPrepared();
+    preparedSource=candidate; preparedPath=path;
+  }
+  return true;
+}
+void discardPrepared() {
+  if(!engineMutex) return;
+  Lock audioLock; storage::Guard sdLock;
+  clearPrepared();
 }
 void volume(uint8_t percent) {
   if (!engineMutex || !output) return;

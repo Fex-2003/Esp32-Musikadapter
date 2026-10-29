@@ -2,6 +2,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Temporäre Laufzeitdiagnose fuer MP3-Uebergaenge. Fuer reale Hoertests bleibt
+// sie aus, weil UART-Ausgaben den kurzen Uebergang selbst messbar verzoegern.
+#ifndef AUDIO_MP3_TRANSITION_TRACE
+#define AUDIO_MP3_TRANSITION_TRACE 0
+#endif
+
 // Alle anwenderseitigen Hardware-/Netzwerkeinstellungen an einer Stelle.
 namespace cfg {
 constexpr char VERSION[] = "2.1.0";
