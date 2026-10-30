@@ -48,6 +48,7 @@ static uint32_t lastActivity=0, lastSdCheck=0, overlayUntil=0, transitionAt=0;
 static String overlay, pendingPlaylist, pendingTrack;
 static int queuedTrack = -1;
 static String preloadTarget;
+static uint32_t preloadEligibleAt = 0;
 enum class Transition { None, Stop, Mode, Sleep };
 static Transition transition=Transition::None;
 static bool sleepRequested=false;
@@ -100,6 +101,7 @@ void stopPlayback() {
   if(queuedTrack>=0 && note.startsWith("Als Naechstes vorgemerkt: ")) note="";
   queuedTrack = -1;
   preloadTarget="";
+  preloadEligibleAt=0;
   if(traceStop) mp3TraceDuration("stopPlayback complete", stopStartedAt);
 }
 static void ensureVisibleSelection() {
@@ -235,6 +237,7 @@ static bool playIndex(size_t index, bool rememberPlaylist = false, size_t resume
     currentSong = activeTracks[index].file;
     currentHadStart = true; note = "";
     preloadTarget="";
+    preloadEligibleAt=millis()+cfg::PLAYLIST_PREPARE_DELAY_MS;
     if (rememberPlaylist) rememberPlaylistTrack(static_cast<uint16_t>(index), resumePosition);
     mp3TraceDuration("playIndex returned after audio::play", playIndexStartedAt);
     return true;
@@ -281,6 +284,7 @@ static int expectedNextPlaylistIndex() {
 static void servicePlaylistPreparation() {
   if(mode!=Mode::Playlist || !playlistRunning || audio::state()!=audio::State::Running ||
      audio::paused() || !audio::emittedSamples()) return;
+  if(static_cast<int32_t>(millis()-preloadEligibleAt)<0) return;
   const int index=expectedNextPlaylistIndex();
   if(index<0) {
     if(!preloadTarget.isEmpty()) { audio::discardPrepared(); preloadTarget=""; }

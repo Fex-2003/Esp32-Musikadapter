@@ -51,6 +51,15 @@ constexpr char UPLOAD_TEMP_NAME[] = "._upload.part";
 constexpr uint32_t DEFAULT_OFF_DELAY_S = 0, MAX_OFF_DELAY_S = 600;
 constexpr uint8_t DEFAULT_SD_VOLUME = 55;
 constexpr uint32_t MP3_BUFFER_BYTES = 4096;
+// Erst den gerade gestarteten Titel stabil ausgeben, dann SD und zweiten
+// Decoder fuer den Folgetitel belasten.
+constexpr uint32_t PLAYLIST_PREPARE_DELAY_MS = 1000;
+// PCM-Anfang des erwarteten Folgetitels. 4096 Stereo-Frames entsprechen bei
+// 44,1 kHz rund 93 ms und bleiben mit Decoder/Reserve im ESP32-Heap.
+constexpr uint32_t PCM_PREFETCH_FRAMES = 4096;
+constexpr uint32_t PCM_PREFETCH_SLICE_FRAMES = 512;
+constexpr uint32_t PCM_PREFETCH_MIN_FRAMES = 1024;
+constexpr uint32_t PCM_PREFETCH_BYTES = PCM_PREFETCH_FRAMES * sizeof(int16_t) * 2;
 constexpr size_t MAX_PLAYLISTS = 32;
 constexpr size_t MAX_TRACKS = 512;       // je Ordner, keine rekursiven Unterordner
 constexpr size_t MAX_TITLE_LEN = 40;    // Bewegung: ohne .mp3, ASCII
